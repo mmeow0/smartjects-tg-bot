@@ -2,10 +2,13 @@ import csv
 import uuid
 
 import ast
+import json
+import re
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from io import StringIO
 import asyncio
+from difflib import SequenceMatcher
 
 from .supabase_client import SupabaseClient
 from .logo_matcher import LogoMatcher
@@ -24,14 +27,7 @@ class CSVProcessor:
         self.xlsx_processor = XLSXProcessor()
 
         # Fetch reference data
-        self.industries = self.supabase.fetch_reference_table("industries")
-        self.audience = self.supabase.fetch_reference_table("audience")
-        self.business_functions = self.supabase.fetch_reference_table("business_functions")
-
-        # Create lookup dictionaries
-        self.industries_dict = {item["name"].lower(): item for item in self.industries}
-        self.audience_dict = {item["name"].lower(): item for item in self.audience}
-        self.functions_dict = {item["name"].lower(): item for item in self.business_functions}
+        self.refresh_reference_data()
 
         # Statistics
         self.reset_stats()
@@ -49,14 +45,74 @@ class CSVProcessor:
             'skipped_exists': 0,
             'skipped_no_tags': 0,
             'errors': 0,
-            'with_logos': 0
+            'with_logos': 0,
+            'unmapped_industries': 0,
+            'unmapped_audience': 0,
+            'unmapped_functions': 0,
+            'total_unmapped': 0
         }
 
-    def parse_csv_array(self, value: str) -> List[str]:
-        """Parse CSV array string to Python list"""
+        # Track unmapped tags for review
+        self.unmapped_tags = {
+            'industries': [],
+            'audience': [],
+            'functions': []
+        }
+
+    def refresh_reference_data(self):
+        """Refresh reference data from database to get latest entries"""
+        logger.info("Refreshing reference data from database...")
+
+        # Fetch reference data
+        self.industries = self.supabase.fetch_reference_table("industries")
+        self.audience = self.supabase.fetch_reference_table("audience")
+        self.business_functions = self.supabase.fetch_reference_table("business_functions")
+
+        # Create lookup dictionaries
+        self.industries_dict = {item["name"].lower(): item for item in self.industries}
+        self.audience_dict = {item["name"].lower(): item for item in self.audience}
+        self.functions_dict = {item["name"].lower(): item for item in self.business_functions}
+
+        logger.info(f"Loaded {len(self.industries)} industries, {len(self.audience)} audiences, {len(self.business_functions)} business functions")
+
+    def parse_csv_array(self, value: str, strict_json: bool = False) -> List[str]:
+        """Parse CSV array string to Python list
+
+        Args:
+            value: String value to parse
+            strict_json: If True, only accept valid JSON arrays
+        """
         if not value or value.strip() == '':
             return []
 
+        value = value.strip()
+
+        # If strict JSON mode, only accept proper JSON arrays
+        if strict_json:
+            if not (value.startswith('[') and value.endswith(']')):
+                return []
+
+            try:
+                import json
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    # Validate all items are strings
+                    valid_items = []
+                    for item in parsed:
+                        if isinstance(item, str) and item.strip():
+                            valid_items.append(item.strip())
+                        else:
+                            logger.warning(f"Invalid item in JSON array: {item}")
+                            return []  # Invalid format, reject entire array
+                    return valid_items
+                else:
+                    logger.warning(f"Value is not a JSON array: {value}")
+                    return []
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse as JSON array: {value}, error: {e}")
+                return []
+
+        # Original parsing logic for non-strict mode
         try:
             # Try to parse as Python list
             parsed = ast.literal_eval(value)
@@ -68,25 +124,349 @@ class CSVProcessor:
         # If that fails, split by commas
         return [item.strip().strip('"').strip("'") for item in value.split(',') if item.strip()]
 
+    def calculate_similarity(self, text1: str, text2: str) -> float:
+        """Calculate similarity between two text strings"""
+        return SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
+
+    def find_best_match(self, tag: str, reference_dict: Dict[str, Dict],
+                       category_type: str = None) -> Optional[str]:
+        """Find best matching entry from existing database entries"""
+        tag_lower = tag.lower()
+        tag_words = set(tag_lower.split())
+
+        # First try exact match
+        if tag_lower in reference_dict:
+            return reference_dict[tag_lower]["name"]
+
+        # Try partial word matching
+        for name_lower, item in reference_dict.items():
+            name_words = set(name_lower.split())
+            # Check if all tag words are in the name
+            if tag_words.issubset(name_words):
+                return item["name"]
+            # Check if all name words are in the tag
+            if name_words.issubset(tag_words):
+                return item["name"]
+
+        # Try to find best match using appropriate logic for each type
+        if category_type == "function":
+            return self.find_best_function_match(tag, reference_dict)
+        elif category_type == "industry":
+            return self.find_best_industry_match(tag, reference_dict)
+        elif category_type == "audience":
+            return self.find_best_audience_match(tag, reference_dict)
+
+        # Fallback to similarity matching with partial matches
+        best_match = None
+        best_score = 0.5  # Lower threshold for better matching
+
+        for name_lower, item in reference_dict.items():
+            # Calculate base similarity
+            similarity = self.calculate_similarity(tag_lower, name_lower)
+
+            # Bonus for partial word matches
+            name_words = set(name_lower.split())
+            common_words = tag_words & name_words
+            if common_words:
+                word_bonus = len(common_words) / max(len(tag_words), len(name_words)) * 0.3
+                similarity += word_bonus
+
+            if similarity > best_score:
+                best_score = similarity
+                best_match = item["name"]
+
+        return best_match
+
+    def find_best_function_match(self, tag: str, reference_dict: Dict[str, Dict]) -> Optional[str]:
+        """Find best matching business function using categorization logic"""
+        tag_lower = tag.lower()
+
+        # Define keyword patterns and synonyms for business functions
+        function_keywords = {
+            "data": ["Data & Analytics", "analytics", "analysis", "visualization", "database", "bi", "insight", "metrics"],
+            "ai": ["AI & Machine Learning", "artificial intelligence", "machine learning", "ml", "deep learning", "neural", "nlp"],
+            "software": ["Software Development", "development", "programming", "application", "coding", "dev", "app", "system"],
+            "customer": ["Customer & User Experience", "user", "experience", "ux", "support", "service", "client", "cx"],
+            "marketing": ["Marketing & Sales", "sales", "advertising", "brand", "campaign", "promotion", "growth", "lead"],
+            "operations": ["Operations & Management", "management", "process", "workflow", "efficiency", "optimization"],
+            "finance": ["Finance & Accounting", "accounting", "payment", "budget", "investment", "financial", "banking"],
+            "hr": ["Human Resources", "employee", "talent", "recruitment", "training", "people", "workforce", "hiring"],
+            "security": ["Security & Compliance", "cyber", "privacy", "protection", "compliance", "risk", "audit"],
+            "communication": ["Communication & Collaboration", "collaboration", "messaging", "team", "chat", "meeting"],
+            "healthcare": ["Healthcare & Medical", "medical", "clinical", "patient", "therapy", "health", "hospital"],
+            "education": ["Education & Training", "training", "learning", "teaching", "course", "e-learning", "educational"],
+            "supply": ["Supply Chain & Logistics", "logistics", "inventory", "shipping", "distribution", "warehouse"],
+            "manufacturing": ["Manufacturing & Production", "production", "industrial", "factory", "assembly", "quality"],
+            "media": ["Media & Content", "content", "video", "audio", "publishing", "streaming", "broadcast"],
+            "research": ["Research & Development", "r&d", "innovation", "experiment", "laboratory", "testing"],
+            "legal": ["Legal & Regulatory", "law", "regulatory", "compliance", "contract", "governance", "policy"],
+            "environmental": ["Environmental & Sustainability", "sustainability", "green", "renewable", "eco", "climate"],
+            "real estate": ["Real Estate & Property", "property", "building", "facility", "construction", "architecture"]
+        }
+
+        # Synonyms mapping
+        synonyms = {
+            "it": "software", "tech": "software", "technology": "software",
+            "ml": "ai", "artificial intelligence": "ai", "machine learning": "ai",
+            "crm": "customer", "ux": "customer", "ui": "customer", "cx": "customer",
+            "hr": "human resources", "people": "hr", "talent": "hr",
+            "cyber": "security", "cybersecurity": "security", "infosec": "security",
+            "collab": "communication", "comms": "communication",
+            "med": "healthcare", "medical": "healthcare", "pharma": "healthcare",
+            "edu": "education", "training": "education", "learning": "education",
+            "scm": "supply", "logistics": "supply", "shipping": "supply",
+            "mfg": "manufacturing", "production": "manufacturing",
+            "r&d": "research", "rd": "research", "innovation": "research"
+        }
+
+        # Normalize tag using synonyms
+        tag_normalized = tag_lower
+        for syn, replacement in synonyms.items():
+            if syn in tag_normalized:
+                tag_normalized = tag_normalized.replace(syn, replacement)
+
+        best_match = None
+        best_score = 0
+
+        # Check each existing function for keyword matches
+        for name_lower, item in reference_dict.items():
+            score = 0
+
+            # Check for keyword matches with enhanced scoring
+            for keyword_group, keywords in function_keywords.items():
+                for keyword in keywords:
+                    if keyword in tag_normalized and keyword in name_lower:
+                        score += len(keyword) * 3  # Increased weight
+                    elif keyword in tag_normalized and keyword_group in name_lower:
+                        score += len(keyword) * 2
+                    # Partial word matching
+                    elif any(word in tag_normalized for word in keyword.split()):
+                        score += 1
+
+            # Enhanced similarity calculation
+            similarity = self.calculate_similarity(tag_normalized, name_lower)
+
+            # Check for word overlap
+            tag_words = set(tag_normalized.split())
+            name_words = set(name_lower.split())
+            common_words = tag_words & name_words
+            if common_words:
+                word_score = len(common_words) / min(len(tag_words), len(name_words)) * 5
+                score += word_score
+
+            score += similarity * 10
+
+            if score > best_score:
+                best_score = score
+                best_match = item["name"]
+
+        return best_match if best_score > 3 else None  # Lower threshold for better matching
+
+    def find_best_industry_match(self, tag: str, reference_dict: Dict[str, Dict]) -> Optional[str]:
+        """Find best matching industry using categorization logic"""
+        tag_lower = tag.lower()
+
+        # Enhanced industry keyword patterns with synonyms
+        industry_keywords = {
+            "healthcare": ["health", "medical", "clinical", "hospital", "pharma", "medicine", "care", "patient", "therapy", "nursing"],
+            "technology": ["software", "tech", "IT", "computer", "digital", "ai", "app", "platform", "system", "cloud", "data"],
+            "finance": ["finance", "bank", "investment", "trading", "insurance", "fintech", "financial", "banking", "fund"],
+            "education": ["education", "training", "learning", "academic", "university", "school", "college", "teaching", "edu"],
+            "manufacturing": ["manufacturing", "industrial", "factory", "production", "assembly", "machinery", "automotive"],
+            "energy": ["energy", "power", "renewable", "solar", "oil", "gas", "utilities", "electricity", "wind", "nuclear"],
+            "transportation": ["transport", "logistics", "shipping", "delivery", "aviation", "airline", "freight", "supply chain"],
+            "retail": ["retail", "e-commerce", "shopping", "store", "marketplace", "consumer", "sales", "merchant"],
+            "media": ["media", "entertainment", "film", "music", "gaming", "publishing", "broadcast", "streaming", "content"],
+            "construction": ["construction", "real estate", "building", "property", "architecture", "infrastructure", "housing"],
+            "agriculture": ["agriculture", "farming", "food", "crop", "livestock", "agri", "agricultural", "rural"],
+            "biotechnology": ["biotech", "biotechnology", "genomics", "life science", "molecular", "genetic", "bio"],
+            "government": ["government", "public", "municipal", "federal", "defense", "military", "policy", "regulatory"],
+            "telecommunications": ["telecom", "telecommunications", "wireless", "network", "mobile", "5g", "broadband"]
+        }
+
+        # Industry synonyms
+        industry_synonyms = {
+            "it": "technology", "tech": "technology", "software": "technology",
+            "medical": "healthcare", "pharma": "healthcare", "health": "healthcare",
+            "banking": "finance", "fintech": "finance", "financial": "finance",
+            "edu": "education", "academic": "education", "school": "education",
+            "mfg": "manufacturing", "industrial": "manufacturing",
+            "telco": "telecommunications", "telecom": "telecommunications",
+            "agri": "agriculture", "farm": "agriculture",
+            "govt": "government", "gov": "government", "public sector": "government"
+        }
+
+        # Normalize tag using synonyms
+        tag_normalized = tag_lower
+        for syn, replacement in industry_synonyms.items():
+            if syn in tag_normalized:
+                tag_normalized = tag_normalized.replace(syn, replacement)
+
+        best_match = None
+        best_score = 0
+
+        for name_lower, item in reference_dict.items():
+            score = 0
+
+            # Check for keyword matches with enhanced scoring
+            for industry_type, keywords in industry_keywords.items():
+                for keyword in keywords:
+                    if keyword in tag_normalized and keyword in name_lower:
+                        score += len(keyword) * 3
+                    elif keyword in tag_normalized and industry_type in name_lower:
+                        score += len(keyword) * 2
+                    # Check partial matches
+                    elif any(word in tag_normalized for word in keyword.split()):
+                        score += 1
+
+            # Enhanced similarity with word overlap
+            similarity = self.calculate_similarity(tag_normalized, name_lower)
+
+            tag_words = set(tag_normalized.split())
+            name_words = set(name_lower.split())
+            common_words = tag_words & name_words
+            if common_words:
+                word_score = len(common_words) / min(len(tag_words), len(name_words)) * 5
+                score += word_score
+
+            score += similarity * 10
+
+            if score > best_score:
+                best_score = score
+                best_match = item["name"]
+
+        return best_match if best_score > 3 else None
+
+    def find_best_audience_match(self, tag: str, reference_dict: Dict[str, Dict]) -> Optional[str]:
+        """Find best matching audience using categorization logic"""
+        tag_lower = tag.lower()
+
+        # Check for educational institutions first (highest priority)
+        educational_patterns = [
+            r'.*\b(?:university|universities|college|colleges|school|schools)\b.*',
+            r'.*\b(?:student|students|learner|learners|teacher|teachers|educator|educators)\b.*',
+            r'.*\b(?:academic|academia|educational|education)\s+(?:institution|organization|body).*',
+            r'.*\b(?:faculty|professor|instructor|curriculum)\b.*'
+        ]
+
+        for pattern in educational_patterns:
+            if re.search(pattern, tag_lower, re.IGNORECASE):
+                # Find educational institution matches
+                for name_lower, item in reference_dict.items():
+                    if re.search(pattern, name_lower, re.IGNORECASE):
+                        return item["name"]
+
+        # Enhanced audience keyword patterns with synonyms
+        audience_keywords = {
+            "researchers": ["research", "researcher", "scientist", "laboratory", "r&d", "phd", "scholar", "academic"],
+            "developers": ["developer", "programmer", "engineer", "software", "coding", "dev", "coder", "tech"],
+            "healthcare": ["medical", "healthcare", "doctor", "physician", "hospital", "nurse", "clinic", "patient"],
+            "enterprise": ["enterprise", "corporate", "business", "company", "organization", "firm", "corporation"],
+            "startups": ["startup", "entrepreneur", "innovation", "venture", "founder", "innovator"],
+            "government": ["government", "public sector", "policy", "municipal", "federal", "state", "agency"],
+            "legal": ["legal", "law", "attorney", "lawyer", "compliance", "regulatory", "counsel"],
+            "media": ["media", "entertainment", "journalist", "content creator", "publisher", "broadcaster"],
+            "retail": ["retail", "e-commerce", "shopping", "consumer", "marketplace", "store", "merchant"],
+            "designers": ["designer", "design", "ui", "ux", "creative", "artist", "graphic"],
+            "managers": ["manager", "executive", "director", "ceo", "cto", "leadership", "admin"],
+            "students": ["student", "learner", "trainee", "pupil", "apprentice", "intern"],
+            "consultants": ["consultant", "advisor", "advisory", "consulting", "expert", "specialist"]
+        }
+
+        # Audience synonyms
+        audience_synonyms = {
+            "dev": "developer", "eng": "engineer", "devs": "developers",
+            "med": "medical", "doc": "doctor", "docs": "doctors",
+            "corp": "corporate", "biz": "business", "co": "company",
+            "gov": "government", "govt": "government",
+            "uni": "university", "edu": "education",
+            "mgr": "manager", "exec": "executive", "mgmt": "management"
+        }
+
+        # Normalize tag using synonyms
+        tag_normalized = tag_lower
+        for syn, replacement in audience_synonyms.items():
+            if syn in tag_normalized:
+                tag_normalized = tag_normalized.replace(syn, replacement)
+
+        best_match = None
+        best_score = 0
+
+        for name_lower, item in reference_dict.items():
+            score = 0
+
+            # Check for keyword matches with enhanced scoring
+            for audience_type, keywords in audience_keywords.items():
+                for keyword in keywords:
+                    if keyword in tag_normalized and keyword in name_lower:
+                        score += len(keyword) * 3
+                    elif keyword in tag_normalized and audience_type in name_lower:
+                        score += len(keyword) * 2
+                    # Check partial matches
+                    elif any(word in tag_normalized for word in keyword.split()):
+                        score += 1
+
+            # Enhanced similarity with word overlap
+            similarity = self.calculate_similarity(tag_normalized, name_lower)
+
+            tag_words = set(tag_normalized.split())
+            name_words = set(name_lower.split())
+            common_words = tag_words & name_words
+            if common_words:
+                word_score = len(common_words) / min(len(tag_words), len(name_words)) * 5
+                score += word_score
+
+            score += similarity * 10
+
+            if score > best_score:
+                best_score = score
+                best_match = item["name"]
+
+        return best_match if best_score > 3 else None
+
     def map_tags_simple(self, industries_input: List[str], audience_input: List[str],
                        functions_input: List[str]) -> Dict:
-        """Simple tag mapping by name"""
+        """Map tags to existing database entries only (no creation of new entries)"""
 
-        # Map input tags
+        # Map input tags to existing entries only
         mapped_industries = []
         for tag in industries_input:
-            if tag.lower() in self.industries_dict:
-                mapped_industries.append(self.industries_dict[tag.lower()]["name"])
+            matched = self.find_best_match(tag, self.industries_dict, "industry")
+            if matched:
+                mapped_industries.append(matched)
+                logger.debug(f"Mapped industry '{tag}' to existing '{matched}'")
+            else:
+                logger.warning(f"No match found for industry: {tag}")
+                self.stats['unmapped_industries'] += 1
+                self.stats['total_unmapped'] += 1
+                if tag not in self.unmapped_tags['industries']:
+                    self.unmapped_tags['industries'].append(tag)
 
         mapped_audience = []
         for tag in audience_input:
-            if tag.lower() in self.audience_dict:
-                mapped_audience.append(self.audience_dict[tag.lower()]["name"])
+            matched = self.find_best_match(tag, self.audience_dict, "audience")
+            if matched:
+                mapped_audience.append(matched)
+                logger.debug(f"Mapped audience '{tag}' to existing '{matched}'")
+            else:
+                logger.warning(f"No match found for audience: {tag}")
+                self.stats['unmapped_audience'] += 1
+                self.stats['total_unmapped'] += 1
+                if tag not in self.unmapped_tags['audience']:
+                    self.unmapped_tags['audience'].append(tag)
 
         mapped_functions = []
         for tag in functions_input:
-            if tag.lower() in self.functions_dict:
-                mapped_functions.append(self.functions_dict[tag.lower()]["name"])
+            matched = self.find_best_match(tag, self.functions_dict, "function")
+            if matched:
+                mapped_functions.append(matched)
+                logger.debug(f"Mapped function '{tag}' to existing '{matched}'")
+            else:
+                logger.warning(f"No match found for business function: {tag}")
+                self.stats['unmapped_functions'] += 1
+                self.stats['total_unmapped'] += 1
+                if tag not in self.unmapped_tags['functions']:
+                    self.unmapped_tags['functions'].append(tag)
 
         return {
             "industries": mapped_industries,
@@ -102,6 +482,34 @@ class CSVProcessor:
             if matched_item:
                 mapped.append({"id": matched_item["id"], "name": matched_item["name"]})
         return mapped
+
+    def get_csv_value(self, row: dict, *possible_keys: str) -> str:
+        """
+        Safely get value from CSV row trying multiple possible keys.
+        Handles variations in column headers like 'mission' vs 'mission ' vs 'mission_'
+        """
+        for key in possible_keys:
+            if key in row and row[key]:
+                return row[key].strip()
+
+        # Try with normalized keys (strip spaces, handle underscores)
+        for key in possible_keys:
+            # Try variations: with/without spaces, with/without underscores
+            variations = [
+                key,
+                key.strip(),
+                key + ' ',
+                ' ' + key,
+                key.replace(' ', '_'),
+                key.replace('_', ' '),
+                key.replace(' ', ''),
+            ]
+
+            for variation in variations:
+                if variation in row and row[variation]:
+                    return row[variation].strip()
+
+        return ''
 
     def parse_date(self, date_str: str) -> str:
         """Parse date to ISO format"""
@@ -139,23 +547,23 @@ class CSVProcessor:
                 continue
 
             smartject = {
-                'url': row.get('url', '').strip(),
-                'publish_date': row.get('publish_date', '').strip(),
-                'summarized': row.get('summarized', '').strip(),
-                'name': row.get('name', '').strip(),
-                'mission': row.get('mission ', '').strip(),  # Note the space in the header
-                'problematics': row.get('problematics', '').strip(),
-                'scope': row.get('scope', '').strip(),
-                'audience': row.get('audience', '').strip(),
-                'how_it_works': row.get('how it works', '').strip(),
-                'architecture': row.get('architecture', '').strip(),
-                'innovation': row.get('innovation', '').strip(),
-                'use_case': row.get('use case', '').strip(),
-                'industries': row.get('industries', '').strip(),
-                'functions': row.get('functions', '').strip(),
-                'link': row.get('link', '').strip(),
-                'date': row.get('date', '').strip(),
-                'team': row.get('team', '').strip()
+                'url': self.get_csv_value(row, 'url'),
+                'publish_date': self.get_csv_value(row, 'publish_date', 'publish date'),
+                'summarized': self.get_csv_value(row, 'summarized'),
+                'name': self.get_csv_value(row, 'name', 'title'),
+                'mission': self.get_csv_value(row, 'mission', 'mission '),
+                'problematics': self.get_csv_value(row, 'problematics'),
+                'scope': self.get_csv_value(row, 'scope'),
+                'audience': self.get_csv_value(row, 'audience'),
+                'how_it_works': self.get_csv_value(row, 'how it works', 'how_it_works', 'how-it-works'),
+                'architecture': self.get_csv_value(row, 'architecture'),
+                'innovation': self.get_csv_value(row, 'innovation'),
+                'use_case': self.get_csv_value(row, 'use case', 'use_case', 'use-case', 'usecase'),
+                'industries': self.get_csv_value(row, 'industries', 'industry'),
+                'functions': self.get_csv_value(row, 'functions', 'function', 'business_functions'),
+                'link': self.get_csv_value(row, 'link', 'url', 'source_url'),
+                'date': self.get_csv_value(row, 'date', 'created_date'),
+                'team': self.get_csv_value(row, 'team', 'teams', 'university', 'organization')
             }
 
             smartjects.append(smartject)
@@ -278,9 +686,9 @@ class CSVProcessor:
 
                 try:
                     # Parse tags from CSV
-                    industries_input = self.parse_csv_array(smartject_data['industries'])
-                    audience_input = self.parse_csv_array(smartject_data['audience'])
-                    functions_input = self.parse_csv_array(smartject_data['functions'])
+                    industries_input = self.parse_csv_array(smartject_data['industries'], strict_json=False)
+                    audience_input = self.parse_csv_array(smartject_data['audience'], strict_json=True)
+                    functions_input = self.parse_csv_array(smartject_data['functions'], strict_json=False)
                     team = self.parse_csv_array(smartject_data['team'])
 
                     # Map tags
@@ -299,6 +707,17 @@ class CSVProcessor:
                         mapped_tags.get('businessFunctions', []),
                         self.functions_dict
                     )
+
+                    # Check if audience format was valid (strict JSON required)
+                    if not audience_input and smartject_data['audience']:
+                        logger.warning(f"  ✕ Skipping {title} — invalid audience format (must be JSON array like [\"Audience1\", \"Audience2\"])")
+                        self.stats['skipped'] += 1
+                        results.append({
+                            'title': title,
+                            'status': 'skipped',
+                            'reason': 'Invalid audience format - must be JSON array'
+                        })
+                        continue
 
                     # Create smartject
                     smartject_id = str(uuid.uuid4())
@@ -428,7 +847,7 @@ class CSVProcessor:
 
     def get_summary(self) -> str:
         """Get processing summary"""
-        return (
+        summary = (
             f"📊 Processing Summary:\n"
             f"Total records: {self.stats['total']}\n"
             f"✅ Processed: {self.stats['processed']}\n"
@@ -436,3 +855,33 @@ class CSVProcessor:
             f"⏭️  Skipped (not relevant): {self.stats['skipped_not_relevant']}\n"
             f"⏭️  Skipped (exists): {self.stats['skipped_exists']}\n"
         )
+
+        if self.stats['total_unmapped'] > 0:
+            summary += (
+                f"\n⚠️  Unmapped tags:\n"
+                f"   Industries: {self.stats['unmapped_industries']}\n"
+                f"   Audience: {self.stats['unmapped_audience']}\n"
+                f"   Functions: {self.stats['unmapped_functions']}\n"
+                f"   Total unmapped: {self.stats['total_unmapped']}"
+            )
+
+        return summary
+
+    def get_unmapped_tags(self) -> Dict[str, List[str]]:
+        """Get all unmapped tags for review"""
+        return self.unmapped_tags
+
+    def export_unmapped_tags_csv(self, filepath: str = 'unmapped_tags.csv'):
+        """Export unmapped tags to CSV file for review"""
+        import csv
+
+        with open(filepath, 'w', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Category', 'Unmapped Tag', 'Count'])
+
+            for category, tags in self.unmapped_tags.items():
+                for tag in tags:
+                    writer.writerow([category, tag, 1])
+
+        logger.info(f"Exported {self.stats['total_unmapped']} unmapped tags to {filepath}")
+        return filepath
