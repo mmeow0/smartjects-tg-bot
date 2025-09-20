@@ -797,7 +797,13 @@ class CSVProcessor:
                         if not self.supabase.insert_smartject_functions(function_relations):
                             raise Exception("Failed to insert function relations")
 
-                    # Teams will be synced in batch at the end
+                    # Sync teams for this smartject individually
+                    if team:
+                        try:
+                            team_sync_result = self.supabase.sync_teams_for_smartject(smartject_id, team)
+                            logger.debug(f"Teams synced for '{title}': {team_sync_result}")
+                        except Exception as e:
+                            logger.warning(f"Error syncing teams for '{title}': {e}")
 
                     self.stats['processed'] += 1
 
@@ -830,15 +836,8 @@ class CSVProcessor:
             if batch_end < len(smartjects_data) and batch_delay > 0:
                 await asyncio.sleep(batch_delay)
 
-        # Batch sync all teams at the end
-        if self.stats['processed'] > 0:
-            logger.info("Performing batch teams synchronization...")
-            try:
-                team_sync_stats = self.supabase.batch_sync_all_teams()
-                logger.info(f"Teams sync completed: {team_sync_stats['new_teams']} new teams, "
-                           f"{team_sync_stats['new_relations']} relations created")
-            except Exception as e:
-                logger.error(f"Error during batch teams sync: {e}")
+        # Teams are now synced individually for each smartject during processing
+        logger.info("All teams have been synced individually during processing")
 
         return {
             'stats': self.stats,
